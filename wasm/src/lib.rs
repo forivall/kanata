@@ -46,6 +46,8 @@ pub fn simulate_impl(cfg: &str, sim: &str) -> Result<String> {
                         for _ in 0..ticks {
                             if !k.can_block_update_idle_waiting(1) {
                                 k.tick_ms(1, &None)?;
+                            } else {
+                                k.kbd_out.tick();
                             }
                         }
                         accumulated_ticks += ticks;
