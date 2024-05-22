@@ -47,6 +47,7 @@ const NOT_VAL: u16 = 0x3000;
 
 const INPUT_VAL: u16 = 851;
 const HISTORICAL_INPUT_VAL: u16 = 852;
+const LAYER_VAL: u16 = 853;
 
 // Binary values:
 // 0b0100 ...
@@ -83,6 +84,7 @@ enum OpCodeType {
     HistoricalInput(HistoricalInput),
     TicksSinceLessThan(TicksSinceNthKey),
     TicksSinceGreaterThan(TicksSinceNthKey),
+    Layer(u16),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -127,66 +129,80 @@ impl<'a, T> Switch<'a, T> {
     /// the currently active keys, and historically pressed keys.
     ///
     /// The `historical_keys` parameter should iterate in the order of most-recent-first.
-    pub fn actions<A1, A2, H1, H2>(
+    pub fn actions<A1, A2, H1, H2, L>(
         &self,
         active_keys: A1,
         active_positions: A2,
         historical_keys: H1,
         historical_positions: H2,
-    ) -> SwitchActions<'a, T, A1, A2, H1, H2>
+        active_layers: L,
+    ) -> SwitchActions<'a, T, A1, A2, H1, H2, L>
     where
         A1: Iterator<Item = KeyCode> + Clone,
         A2: Iterator<Item = KCoord> + Clone,
         H1: Iterator<Item = HistoricalEvent<KeyCode>> + Clone,
         H2: Iterator<Item = HistoricalEvent<KCoord>> + Clone,
+        L: Iterator<Item = u16> + Clone,
     {
         SwitchActions {
             cases: self.cases,
-            active_keys,
-            active_positions,
-            historical_keys,
-            historical_positions,
             case_index: 0,
+            state: StateForSwitch {
+                active_keys,
+                active_positions,
+                historical_keys,
+                historical_positions,
+                active_layers,
+            },
         }
     }
 }
 
 #[derive(Debug, Clone)]
-/// Iterator returned by `Switch::actions`.
-pub struct SwitchActions<'a, T, A1, A2, H1, H2>
+struct StateForSwitch<A1, A2, H1, H2, L>
 where
     A1: Iterator<Item = KeyCode> + Clone,
     A2: Iterator<Item = KCoord> + Clone,
     H1: Iterator<Item = HistoricalEvent<KeyCode>> + Clone,
     H2: Iterator<Item = HistoricalEvent<KCoord>> + Clone,
+    L: Iterator<Item = u16> + Clone,
 {
-    cases: &'a [(&'a [OpCode], &'a Action<'a, T>, BreakOrFallthrough)],
     active_keys: A1,
     active_positions: A2,
     historical_keys: H1,
     historical_positions: H2,
-    case_index: usize,
+    active_layers: L,
 }
 
-impl<'a, T, A1, A2, H1, H2> Iterator for SwitchActions<'a, T, A1, A2, H1, H2>
+#[derive(Debug, Clone)]
+/// Iterator returned by `Switch::actions`.
+pub struct SwitchActions<'a, T, A1, A2, H1, H2, L>
 where
     A1: Iterator<Item = KeyCode> + Clone,
     A2: Iterator<Item = KCoord> + Clone,
     H1: Iterator<Item = HistoricalEvent<KeyCode>> + Clone,
     H2: Iterator<Item = HistoricalEvent<KCoord>> + Clone,
+    L: Iterator<Item = u16> + Clone,
+{
+    cases: &'a [(&'a [OpCode], &'a Action<'a, T>, BreakOrFallthrough)],
+    state: StateForSwitch<A1, A2, H1, H2, L>,
+    case_index: usize,
+}
+
+impl<'a, T, A1, A2, H1, H2, L> Iterator for SwitchActions<'a, T, A1, A2, H1, H2, L>
+where
+    A1: Iterator<Item = KeyCode> + Clone,
+    A2: Iterator<Item = KCoord> + Clone,
+    H1: Iterator<Item = HistoricalEvent<KeyCode>> + Clone,
+    H2: Iterator<Item = HistoricalEvent<KCoord>> + Clone,
+    L: Iterator<Item = u16> + Clone,
 {
     type Item = &'a Action<'a, T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.case_index < self.cases.len() {
             let case = &self.cases[self.case_index];
-            if evaluate_boolean(
-                case.0,
-                self.active_keys.clone(),
-                self.active_positions.clone(),
-                self.historical_keys.clone(),
-                self.historical_positions.clone(),
-            ) {
+            if evaluate_boolean(case.0, self.state.clone()) {
                 let ret_ac = case.1;
                 match case.2 {
                     Break => self.case_index = self.cases.len(),
@@ -288,6 +304,12 @@ impl OpCode {
         )
     }
 
+    /// Return OpCodes specifying an active layer check.
+    pub fn new_layer(layer: u16) -> (Self, Self) {
+        assert!(usize::from(layer) < crate::layout::MAX_LAYERS);
+        (Self(LAYER_VAL), Self(layer))
+    }
+
     /// Return the interpretation of this `OpCode`.
     fn opcode_type(self, next: Option<OpCode>) -> OpCodeType {
         if self.0 < KEY_MAX {
@@ -300,6 +322,7 @@ impl OpCode {
                     input: (((op2.0 >> 14) & 0x3) as u8, op2.0 & 0x3FF),
                     how_far_back: (op2.0 >> 11) as u8 & 0x7,
                 }),
+                LAYER_VAL => OpCodeType::Layer(op2.0),
                 _ => unreachable!("unexpected opcode {self:?}"),
             }
         } else {
@@ -337,13 +360,17 @@ impl From<u16> for OperatorAndEndIndex {
 }
 
 /// Evaluate the return value of an expression evaluated on the given key codes.
-fn evaluate_boolean(
+fn evaluate_boolean<A1, A2, H1, H2, L>(
     bool_expr: &[OpCode],
-    key_codes: impl Iterator<Item = KeyCode> + Clone,
-    inputs: impl Iterator<Item = KCoord> + Clone,
-    historical_keys: impl Iterator<Item = HistoricalEvent<KeyCode>> + Clone,
-    historical_inputs: impl Iterator<Item = HistoricalEvent<KCoord>> + Clone,
-) -> bool {
+    state: StateForSwitch<A1, A2, H1, H2, L>,
+) -> bool
+where
+    A1: Iterator<Item = KeyCode> + Clone,
+    A2: Iterator<Item = KCoord> + Clone,
+    H1: Iterator<Item = HistoricalEvent<KeyCode>> + Clone,
+    H2: Iterator<Item = HistoricalEvent<KCoord>> + Clone,
+    L: Iterator<Item = u16> + Clone,
+{
     let mut ret = true;
     let mut current_index = 0;
     let mut current_end_index = bool_expr.len();
@@ -388,24 +415,30 @@ fn evaluate_boolean(
                 continue;
             }
             OpCodeType::KeyCode(kc) => {
-                ret = key_codes.clone().any(|kc_input| kc_input as u16 == kc);
+                ret = state
+                    .active_keys
+                    .clone()
+                    .any(|kc_input| kc_input as u16 == kc);
             }
             OpCodeType::HistoricalKeyCode(hkc) => {
-                ret = historical_keys
+                ret = state
+                    .historical_keys
                     .clone()
                     .nth(hkc.how_far_back as usize)
                     .map(|he| he.event as u16 == hkc.key_code)
                     .unwrap_or(false);
             }
             OpCodeType::TicksSinceLessThan(tsnk) => {
-                ret = historical_keys
+                ret = state
+                    .historical_keys
                     .clone()
                     .nth(tsnk.nth_key.into())
                     .map(|he| he.ticks_since_occurrence <= tsnk.ticks_since)
                     .unwrap_or(false);
             }
             OpCodeType::TicksSinceGreaterThan(tsnk) => {
-                ret = historical_keys
+                ret = state
+                    .historical_keys
                     .clone()
                     .nth(tsnk.nth_key.into())
                     .map(|he| he.ticks_since_occurrence > tsnk.ticks_since)
@@ -414,16 +447,27 @@ fn evaluate_boolean(
             OpCodeType::Input(coord) => {
                 // opcode has size 2
                 current_index += 1;
-                ret = inputs.clone().any(|c| c == coord)
+                ret = state.active_positions.clone().any(|c| c == coord)
             }
             OpCodeType::HistoricalInput(hki) => {
                 // opcode has size 2
                 current_index += 1;
-                ret = historical_inputs
+                ret = state
+                    .historical_positions
                     .clone()
                     .nth(hki.how_far_back as usize)
                     .map(|he| he.event == hki.input)
                     .unwrap_or(false)
+            }
+            OpCodeType::Layer(layer) => {
+                // opcode has size 2
+                current_index += 1;
+                ret = state
+                    .active_layers
+                    .clone()
+                    .next()
+                    .map(|l| l == layer)
+                    .unwrap_or(false);
             }
         };
         if current_op == Not {
